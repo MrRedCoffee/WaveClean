@@ -27,3 +27,26 @@ cd WaveClean
 
 # Install dependencies
 pip install -r requirements.txt
+
+```
+
+### Usage
+```bash
+python audio_processor.py input.mp3 output.mp3
+```
+
+### Advanced
+```bash
+python audio_processor.py raw_audio.m4a cleaned_audio.wav \
+  --silence_threshold -45 \
+  --min_silence_len 0.2 \
+  --breath_cutoff 150 \
+  --target_dBFS -16.0```
+```
+
+
+Parameter	Description	Default	Range
+--silence_threshold	Silence detection threshold (dB)	-40	[-60, -20]
+--min_silence_len	Minimum silence duration (seconds)	0.3	[0.1, 2.0]
+--breath_cutoff	Breath removal cutoff (Hz)	200	[80, 400]
+--target_dBFS	Target output level (dB)	-20.0	[-30.0, -0.0]
