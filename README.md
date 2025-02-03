@@ -44,7 +44,7 @@ python audio_processor.py raw_audio.m4a cleaned_audio.wav \
   --target_dBFS -16.0```
 ```
 
-## Troubleshooting 
+## Troubleshooting 🛠️
 ### Common Issues
 Click artifacts during silence removal:
 ```bash
