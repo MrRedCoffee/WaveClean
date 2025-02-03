@@ -44,9 +44,22 @@ python audio_processor.py raw_audio.m4a cleaned_audio.wav \
   --target_dBFS -16.0```
 ```
 
+## Troubleshooting 
+### Common Issues
+Click artifacts during silence removal:
+```bash
+# Increase fade time in code (line 84)
+fade_time = min(100, duration // 4)  # Increased from 50ms to 100ms
+```
 
-Parameter	Description	Default	Range
---silence_threshold	Silence detection threshold (dB)	-40	[-60, -20]
---min_silence_len	Minimum silence duration (seconds)	0.3	[0.1, 2.0]
---breath_cutoff	Breath removal cutoff (Hz)	200	[80, 400]
---target_dBFS	Target output level (dB)	-20.0	[-30.0, -0.0]
+FFmpeg not found:
+```bash
+# Verify FFmpeg installation
+ffmpeg -version
+# Windows users: Add FFmpeg to PATH
+```
+
+High CPU Usage:
+- Use smaller FFT sizes (512 instead of 1024)
+- Reduce number of processing stages
+
