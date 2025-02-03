@@ -23,7 +23,7 @@ Professional audio processing pipeline with multi-stage noise reduction and inte
 ```bash
 # Clone repository
 git clone https://github.com/MrRedCoffee/WaveClean.git
-cd audio-processor
+cd WaveClean
 
 # Install dependencies
 pip install -r requirements.txt
