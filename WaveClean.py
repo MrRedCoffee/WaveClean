@@ -116,11 +116,24 @@ def extract_audio_from_mp4(mp4_file, ffmpeg_path):
         error_msg = e.stderr.decode() if hasattr(e, 'stderr') else str(e)
         raise RuntimeError(f"FFmpeg failed to extract audio: {error_msg}")
 
-def process_advanced_audio(input_file, output_file, 
-                          silence_threshold=-40, 
+def _sample_width_to_dtype(sample_width):
+    """Map pydub sample_width (bytes) to numpy int dtype and full-scale value."""
+    if sample_width == 1:
+        return np.int8, 128.0
+    if sample_width == 2:
+        return np.int16, 32768.0
+    if sample_width == 4:
+        return np.int32, 2147483648.0
+    return np.int16, 32768.0
+
+
+def process_advanced_audio(input_file, output_file,
+                          silence_threshold=-40,
                           min_silence_len=0.3,
-                          breath_cutoff=200,
+                          breath_cutoff=100,
                           target_dBFS=-20.0,
+                          noise_reduction_strength=0.5,
+                          remove_silence=True,
                           ffmpeg_path="ffmpeg"):
 
     # Handle MP4 files by extracting audio first
@@ -129,15 +142,23 @@ def process_advanced_audio(input_file, output_file,
         temp_file = extract_audio_from_mp4(input_file, ffmpeg_path)
         input_file = temp_file
 
-    audio_segment = AudioSegment.from_file(input_file).set_channels(1)
+    audio_segment = AudioSegment.from_file(input_file)
     sample_rate = audio_segment.frame_rate
-    
-    audio_segment = audio_segment.high_pass_filter(80)
-    
-    samples = np.array(audio_segment.get_array_of_samples(), dtype=np.float32) / 32767.0
+    channels = audio_segment.channels
+    sample_width = audio_segment.sample_width
+    np_dtype, max_val = _sample_width_to_dtype(sample_width)
 
+    # Decode to float, preserving channels (shape: (channels, frames))
+    raw = np.array(audio_segment.get_array_of_samples(), dtype=np.float32) / max_val
+    if channels > 1:
+        raw = raw.reshape(-1, channels).T
+    else:
+        raw = raw[np.newaxis, :]
+
+    # Build the noise profile from quiet sections of a mono mix
+    mono_mix = raw.mean(axis=0)
     non_silent_intervals = librosa.effects.split(
-        samples,
+        mono_mix,
         top_db=abs(silence_threshold),
         frame_length=2048,
         hop_length=512
@@ -147,75 +168,88 @@ def process_advanced_audio(input_file, output_file,
     prev_end = 0
     for start, end in non_silent_intervals:
         if start > prev_end:
-            noise_segment = samples[prev_end:start]
-            if len(noise_segment) > 0:
-                noise_samples.append(noise_segment)
+            seg = mono_mix[prev_end:start]
+            if len(seg) > 0:
+                noise_samples.append(seg)
         prev_end = end
 
-    if len(noise_samples) > 0:
+    if noise_samples:
         noise_signal = np.concatenate(noise_samples)
-        if len(noise_signal) < sample_rate:  # If collected noise is less than 1 second
-            noise_signal = np.tile(noise_signal, (sample_rate // len(noise_signal)) + 1)[:sample_rate]
+        if len(noise_signal) < sample_rate:
+            reps = (sample_rate // max(len(noise_signal), 1)) + 1
+            noise_signal = np.tile(noise_signal, reps)[:sample_rate]
     else:
-        noise_signal = samples[:sample_rate]
+        noise_signal = mono_mix[:min(sample_rate, len(mono_mix))]
 
-    cleaned_signal1 = nr.reduce_noise(
-        y=samples,
-        y_noise=noise_signal,
-        sr=sample_rate,
-        prop_decrease=0.7,
-        n_fft=512,
-        hop_length=128,
-        stationary=False,
-        use_tqdm=False
-    )
+    # Single, gentle spectral denoise per channel (avoids "musical noise" from
+    # stacking aggressive passes).
+    cleaned = np.empty_like(raw)
+    for c in range(raw.shape[0]):
+        cleaned[c] = nr.reduce_noise(
+            y=raw[c],
+            y_noise=noise_signal,
+            sr=sample_rate,
+            prop_decrease=noise_reduction_strength,
+            n_fft=1024,
+            hop_length=256,
+            stationary=False,
+            use_tqdm=False
+        )
 
-    sos = signal.butter(2, breath_cutoff, 'hp', fs=sample_rate, output='sos')
-    filtered_signal = signal.sosfiltfilt(sos, cleaned_signal1)
+    # Single high-pass for rumble/breath. Applied once here instead of
+    # stacking three high-pass filters across the pipeline.
+    if breath_cutoff and breath_cutoff > 0:
+        sos = signal.butter(2, breath_cutoff, 'hp', fs=sample_rate, output='sos')
+        for c in range(cleaned.shape[0]):
+            cleaned[c] = signal.sosfiltfilt(sos, cleaned[c])
 
-    # Second pass noise reduction
-    cleaned_signal2 = nr.reduce_noise(
-        y=filtered_signal,
-        y_noise=noise_signal,
-        sr=sample_rate,
-        prop_decrease=0.5,
-        n_fft=1024,
-        hop_length=256,
-        stationary=True,
-        use_tqdm=False
-    )
+    # Re-interleave and clip before quantizing back to int.
+    cleaned = np.clip(cleaned, -1.0, 1.0)
+    interleaved = (cleaned.T.reshape(-1) * (max_val - 1)).astype(np_dtype)
 
     processed_audio = AudioSegment(
-        (cleaned_signal2 * 32767).astype(np.int16).tobytes(),
+        interleaved.tobytes(),
         frame_rate=sample_rate,
-        sample_width=2,
-        channels=1
+        sample_width=sample_width,
+        channels=channels
     )
 
-    processed_audio = compress_dynamic_range(processed_audio, threshold=-35, ratio=4.0, attack=5, release=50)
-
-    audio_chunks = silence.split_on_silence(
-        processed_audio,
-        silence_thresh=silence_threshold,
-        min_silence_len=int(min_silence_len * 1000),
-        keep_silence=150
+    # Gentle compression — preserves dynamics for voice content.
+    processed_audio = compress_dynamic_range(
+        processed_audio, threshold=-20.0, ratio=2.0, attack=5, release=50
     )
 
-    faded_chunks = []
-    for chunk in audio_chunks:
-        duration = len(chunk)
-        fade_time = min(50, duration // 4)  # Maximum 50ms fade
-        faded_chunks.append(chunk.fade_in(fade_time).fade_out(fade_time))
-
-    output = sum(faded_chunks, AudioSegment.empty())
+    if remove_silence:
+        audio_chunks = silence.split_on_silence(
+            processed_audio,
+            silence_thresh=silence_threshold,
+            min_silence_len=int(min_silence_len * 1000),
+            keep_silence=200
+        )
+        if audio_chunks:
+            output = audio_chunks[0]
+            for chunk in audio_chunks[1:]:
+                output = output.append(chunk, crossfade=20)
+        else:
+            output = processed_audio
+    else:
+        output = processed_audio
 
     output = normalize(output, headroom=1.5)
-    output = output.apply_gain(target_dBFS - output.dBFS)
+    if output.dBFS != float('-inf'):
+        output = output.apply_gain(target_dBFS - output.dBFS)
 
-    output = output.low_pass_filter(10000).high_pass_filter(120)
+    # Pick output format from the file extension instead of forcing MP3.
+    _, ext = os.path.splitext(output_file)
+    fmt = ext.lstrip('.').lower() or 'wav'
+    export_kwargs = {"format": fmt}
+    if fmt in ("mp3",):
+        export_kwargs["bitrate"] = "192k"
+    elif fmt in ("m4a", "aac"):
+        export_kwargs["bitrate"] = "256k"
 
-    output.export(output_file, format="mp3", bitrate="192k")
-    
+    output.export(output_file, **export_kwargs)
+
     # Clean up temporary file if one was created
     if temp_file and os.path.exists(temp_file):
         os.remove(temp_file)
